@@ -93,6 +93,7 @@ class Program
         bool listTabs = args.Contains("--tabs");
         bool exactMatch = args.Contains("--exact");
         bool isTab = args.Contains("--tab");
+        bool fullPage = args.Contains("--scroll");
         int port = GetPortArg(args) ?? DEFAULT_CDP_PORT;
 
         // Get the search term (first non-flag argument)
@@ -118,7 +119,7 @@ class Program
 
         if (isTab)
         {
-            return await CaptureBrowserTab(searchTerm, exactMatch, port);
+            return await CaptureBrowserTab(searchTerm, exactMatch, port, fullPage);
         }
         else
         {
@@ -139,6 +140,7 @@ class Program
         Console.WriteLine("Options:");
         Console.WriteLine("  --exact          Match title exactly (default: partial match)");
         Console.WriteLine("  --tab            Capture browser tab instead of window (uses CDP)");
+        Console.WriteLine("  --scroll         Capture full scrollable page as one tall image (tab only)");
         Console.WriteLine("  --port <num>     CDP port (default: 9222)");
         Console.WriteLine();
         Console.WriteLine("Browser Tab Capture Setup:");
@@ -151,6 +153,7 @@ class Program
         Console.WriteLine("  WindowCapture \"Notepad\"");
         Console.WriteLine("  WindowCapture --tabs");
         Console.WriteLine("  WindowCapture --tab \"GitHub\"");
+        Console.WriteLine("  WindowCapture --tab \"GitHub\" --scroll");
         Console.WriteLine("  WindowCapture --tab \"google.com\" --port 9223");
     }
 
@@ -379,7 +382,7 @@ class Program
         return 0;
     }
 
-    private static async Task<int> CaptureBrowserTab(string searchTerm, bool exactMatch, int port)
+    private static async Task<int> CaptureBrowserTab(string searchTerm, bool exactMatch, int port, bool fullPage)
     {
         var tabs = await GetBrowserTabs(port);
 
@@ -418,7 +421,7 @@ class Program
             return 1;
         }
 
-        string? screenshotPath = await CaptureTabViaCDP(matchingTab);
+        string? screenshotPath = await CaptureTabViaCDP(matchingTab, fullPage);
 
         if (screenshotPath != null)
         {
@@ -434,7 +437,37 @@ class Program
         }
     }
 
-    private static async Task<string?> CaptureTabViaCDP(BrowserTab tab)
+    // Sends a CDP command and waits for the response matching the given id,
+    // discarding any event messages that arrive before it.
+    private static async Task<JsonDocument> SendCdpCommandAsync(ClientWebSocket ws, int id, string method, object? cmdParams = null)
+    {
+        var command = new Dictionary<string, object?> { ["id"] = id, ["method"] = method };
+        if (cmdParams != null)
+            command["params"] = cmdParams;
+
+        string commandJson = JsonSerializer.Serialize(command);
+        await ws.SendAsync(Encoding.UTF8.GetBytes(commandJson), WebSocketMessageType.Text, true, CancellationToken.None);
+
+        while (true)
+        {
+            using var ms = new MemoryStream();
+            var chunk = new byte[65536];
+            WebSocketReceiveResult result;
+            do
+            {
+                result = await ws.ReceiveAsync(chunk, CancellationToken.None);
+                ms.Write(chunk, 0, result.Count);
+            } while (!result.EndOfMessage);
+
+            var doc = JsonDocument.Parse(ms.ToArray());
+            if (doc.RootElement.TryGetProperty("id", out var idProp) && idProp.GetInt32() == id)
+                return doc;
+
+            doc.Dispose();
+        }
+    }
+
+    private static async Task<string?> CaptureTabViaCDP(BrowserTab tab, bool fullPage)
     {
         using var ws = new ClientWebSocket();
 
@@ -442,57 +475,77 @@ class Program
         {
             await ws.ConnectAsync(new Uri(tab.WebSocketDebuggerUrl), CancellationToken.None);
 
-            // Send Page.captureScreenshot command
-            var command = new
+            string base64Data;
+
+            if (fullPage)
             {
-                id = 1,
-                method = "Page.captureScreenshot",
-                @params = new
+                // Step 1: get full page dimensions
+                using var metricsDoc = await SendCdpCommandAsync(ws, 1, "Page.getLayoutMetrics");
+                var resultProp = metricsDoc.RootElement.GetProperty("result");
+
+                // Prefer cssContentSize (Chrome 77+), fall back to contentSize
+                var contentSize = resultProp.TryGetProperty("cssContentSize", out var css)
+                    ? css
+                    : resultProp.GetProperty("contentSize");
+
+                int pageWidth = (int)Math.Ceiling(contentSize.GetProperty("width").GetDouble());
+                int pageHeight = (int)Math.Ceiling(contentSize.GetProperty("height").GetDouble());
+
+                // Step 2: expand viewport to full page height
+                using var overrideDoc = await SendCdpCommandAsync(ws, 2, "Emulation.setDeviceMetricsOverride", new
+                {
+                    width = pageWidth,
+                    height = pageHeight,
+                    deviceScaleFactor = 1,
+                    mobile = false
+                });
+
+                // Step 3: capture full page
+                using var screenshotDoc = await SendCdpCommandAsync(ws, 3, "Page.captureScreenshot", new
+                {
+                    format = "png",
+                    captureBeyondViewport = true
+                });
+
+                // Step 4: restore original viewport
+                using var clearDoc = await SendCdpCommandAsync(ws, 4, "Emulation.clearDeviceMetricsOverride");
+
+                if (!screenshotDoc.RootElement.TryGetProperty("result", out var screenshotResult) ||
+                    !screenshotResult.TryGetProperty("data", out var dataEl))
+                {
+                    if (screenshotDoc.RootElement.TryGetProperty("error", out var err))
+                        Console.Error.WriteLine($"CDP Error: {err}");
+                    return null;
+                }
+
+                base64Data = dataEl.GetString()!;
+            }
+            else
+            {
+                using var screenshotDoc = await SendCdpCommandAsync(ws, 1, "Page.captureScreenshot", new
                 {
                     format = "png",
                     captureBeyondViewport = false
+                });
+
+                if (!screenshotDoc.RootElement.TryGetProperty("result", out var screenshotResult) ||
+                    !screenshotResult.TryGetProperty("data", out var dataEl))
+                {
+                    if (screenshotDoc.RootElement.TryGetProperty("error", out var err))
+                        Console.Error.WriteLine($"CDP Error: {err}");
+                    return null;
                 }
-            };
 
-            string commandJson = JsonSerializer.Serialize(command);
-            var sendBuffer = Encoding.UTF8.GetBytes(commandJson);
-            await ws.SendAsync(sendBuffer, WebSocketMessageType.Text, true, CancellationToken.None);
-
-            // Receive response
-            var receiveBuffer = new byte[1024 * 1024 * 10]; // 10MB buffer for large screenshots
-            var result = await ws.ReceiveAsync(receiveBuffer, CancellationToken.None);
-
-            string responseJson = Encoding.UTF8.GetString(receiveBuffer, 0, result.Count);
-
-            // Handle fragmented messages
-            while (!result.EndOfMessage)
-            {
-                result = await ws.ReceiveAsync(receiveBuffer, CancellationToken.None);
-                responseJson += Encoding.UTF8.GetString(receiveBuffer, 0, result.Count);
+                base64Data = dataEl.GetString()!;
             }
 
-            using var doc = JsonDocument.Parse(responseJson);
-            var root = doc.RootElement;
+            byte[] imageData = Convert.FromBase64String(base64Data);
 
-            if (root.TryGetProperty("result", out var resultProp) &&
-                resultProp.TryGetProperty("data", out var dataProp))
-            {
-                string base64Data = dataProp.GetString()!;
-                byte[] imageData = Convert.FromBase64String(base64Data);
+            string fileName = $"screenshot_{DateTime.Now:yyyyMMdd_HHmmss}.png";
+            string filePath = Path.Combine(Path.GetTempPath(), fileName);
 
-                string fileName = $"screenshot_{DateTime.Now:yyyyMMdd_HHmmss}.png";
-                string filePath = Path.Combine(Path.GetTempPath(), fileName);
-
-                await File.WriteAllBytesAsync(filePath, imageData);
-                return filePath;
-            }
-
-            if (root.TryGetProperty("error", out var errorProp))
-            {
-                Console.Error.WriteLine($"CDP Error: {errorProp}");
-            }
-
-            return null;
+            await File.WriteAllBytesAsync(filePath, imageData);
+            return filePath;
         }
         catch (Exception ex)
         {

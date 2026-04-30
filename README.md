@@ -48,6 +48,10 @@ windowcapture --tab "Stack Overflow"
 windowcapture --tab "google.com"
 windowcapture --tab "localhost:3000"
 
+# Capture full scrollable page as one tall image
+windowcapture --tab "GitHub" --scroll
+windowcapture --tab "localhost:3000" --scroll
+
 # Use a custom CDP port (default: 9222)
 windowcapture --tabs --port 9223
 windowcapture --tab "GitHub" --port 9223
@@ -81,6 +85,7 @@ Or enable permanently in `edge://flags` → "Enable remote debugging".
 - **Silent capture** — does not bring the window to the foreground or change focus
 - **Background windows** — captures windows hidden behind others
 - **Browser tabs** — captures any tab, not just the active one (via CDP)
+- **Full-page scroll capture** — captures the entire scrollable page as one tall image (`--scroll`)
 - **Partial matching** — default search is case-insensitive substring match
 - **No dependencies** — single dotnet tool, no native binaries to install
 
@@ -91,6 +96,7 @@ Or enable permanently in `edge://flags` → "Enable remote debugging".
 | `--list` | List all visible windows |
 | `--tabs` | List all browser tabs (requires CDP) |
 | `--tab` | Capture a browser tab instead of a window |
+| `--scroll` | Capture full scrollable page as one tall image (tab only) |
 | `--exact` | Match title exactly instead of partial match |
 | `--port <num>` | CDP port (default: 9222) |
 
