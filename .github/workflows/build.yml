@@ -17,10 +17,10 @@ jobs:
     steps:
 
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Setup .NET
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: '8.0.x'
 
@@ -45,7 +45,7 @@ jobs:
       run: dotnet pack -c Release -p:Version=${{ steps.version.outputs.VERSION }} --output ./nupkgs
 
     - name: Upload NuGet package
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: nuget
         path: ./nupkgs/*.nupkg
@@ -57,7 +57,7 @@ jobs:
 
     - name: Create GitHub Release
       if: startsWith(github.ref, 'refs/tags/v')
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         generate_release_notes: true
         files: ./nupkgs/*.nupkg
