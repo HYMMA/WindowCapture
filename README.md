@@ -4,7 +4,7 @@
 [![NuGet Downloads](https://img.shields.io/nuget/dt/WindowCapture.svg)](https://www.nuget.org/packages/WindowCapture)
 [![Build](https://github.com/Hymma/WindowCapture/actions/workflows/build.yml/badge.svg)](https://github.com/Hymma/WindowCapture/actions/workflows/build.yml)
 
-A .NET global tool that captures screenshots of windows and browser tabs **without bringing them to focus**. Uses Win32 `PrintWindow` API for windows and Chrome DevTools Protocol (CDP) for browser tabs.
+A .NET global tool that captures screenshots of windows and browser tabs **without bringing them to focus**. Uses Win32 `PrintWindow` API for windows and Chrome DevTools Protocol (CDP) for Chromium browser tabs and WebDriver BiDi for Firefox tabs.
 
 ## Install
 
@@ -52,7 +52,7 @@ windowcapture --tab "localhost:3000"
 windowcapture --tab "GitHub" --scroll
 windowcapture --tab "localhost:3000" --scroll
 
-# Use a custom CDP port (default: 9222)
+# Use a custom remote debugging port (default: 9222)
 windowcapture --tabs --port 9223
 windowcapture --tab "GitHub" --port 9223
 ```
@@ -76,15 +76,20 @@ msedge --remote-debugging-port=9222
 
 # Chrome
 chrome --remote-debugging-port=9222
+
+# Firefox
+firefox --remote-debugging-port 9222
 ```
 
 Or enable permanently in `edge://flags` → "Enable remote debugging".
+
+Firefox no longer supports CDP, so for Firefox the tool falls back automatically to WebDriver BiDi on the same port. Firefox allows only one BiDi client at a time, so close other automation tools (Playwright, Selenium) attached to it first.
 
 ## Features
 
 - **Silent capture** — does not bring the window to the foreground or change focus
 - **Background windows** — captures windows hidden behind others
-- **Browser tabs** — captures any tab, not just the active one (via CDP)
+- **Browser tabs** — captures any tab, not just the active one (CDP for Edge/Chrome, WebDriver BiDi for Firefox)
 - **Full-page scroll capture** — captures the entire scrollable page as one tall image (`--scroll`)
 - **Partial matching** — default search is case-insensitive substring match
 - **No dependencies** — single dotnet tool, no native binaries to install
@@ -94,11 +99,11 @@ Or enable permanently in `edge://flags` → "Enable remote debugging".
 | Option | Description |
 |--------|-------------|
 | `--list` | List all visible windows |
-| `--tabs` | List all browser tabs (requires CDP) |
+| `--tabs` | List all browser tabs (CDP or Firefox BiDi) |
 | `--tab` | Capture a browser tab instead of a window |
 | `--scroll` | Capture full scrollable page as one tall image (tab only) |
 | `--exact` | Match title exactly instead of partial match |
-| `--port <num>` | CDP port (default: 9222) |
+| `--port <num>` | Remote debugging port (default: 9222) |
 
 ## License
 

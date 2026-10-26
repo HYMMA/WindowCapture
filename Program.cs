@@ -135,17 +135,18 @@ class Program
         Console.WriteLine("  WindowCapture <title> [options]     Capture a window by title");
         Console.WriteLine("  WindowCapture --tab <title>         Capture a browser tab by title/URL");
         Console.WriteLine("  WindowCapture --list                List all visible windows");
-        Console.WriteLine("  WindowCapture --tabs                List all browser tabs (requires CDP)");
+        Console.WriteLine("  WindowCapture --tabs                List all browser tabs (CDP or Firefox BiDi)");
         Console.WriteLine();
         Console.WriteLine("Options:");
         Console.WriteLine("  --exact          Match title exactly (default: partial match)");
-        Console.WriteLine("  --tab            Capture browser tab instead of window (uses CDP)");
+        Console.WriteLine("  --tab            Capture browser tab instead of window (CDP or Firefox BiDi)");
         Console.WriteLine("  --scroll         Capture full scrollable page as one tall image (tab only)");
-        Console.WriteLine("  --port <num>     CDP port (default: 9222)");
+        Console.WriteLine("  --port <num>     Remote debugging port (default: 9222)");
         Console.WriteLine();
         Console.WriteLine("Browser Tab Capture Setup:");
         Console.WriteLine("  Edge:   Start with: msedge --remote-debugging-port=9222");
         Console.WriteLine("  Chrome: Start with: chrome --remote-debugging-port=9222");
+        Console.WriteLine("  Firefox: Start with: firefox --remote-debugging-port 9222 (uses WebDriver BiDi)");
         Console.WriteLine("  Or enable in edge://flags -> \"Enable remote debugging\"");
         Console.WriteLine();
         Console.WriteLine("Examples:");
@@ -356,45 +357,53 @@ class Program
         }
     }
 
+    private static void PrintNoTabsHelp(int port)
+    {
+        Console.Error.WriteLine($"Error: No browser tabs found on port {port}");
+        Console.Error.WriteLine();
+        Console.Error.WriteLine("Make sure your browser is running with remote debugging enabled:");
+        Console.Error.WriteLine("  Edge:    msedge --remote-debugging-port=9222");
+        Console.Error.WriteLine("  Chrome:  chrome --remote-debugging-port=9222");
+        Console.Error.WriteLine("  Firefox: firefox --remote-debugging-port 9222");
+    }
+
     private static async Task<int> ListBrowserTabs(int port)
     {
         var tabs = await GetBrowserTabs(port);
+        string protocol = "CDP";
 
         if (tabs.Count == 0)
         {
-            Console.Error.WriteLine($"Error: No browser tabs found on port {port}");
-            Console.Error.WriteLine();
-            Console.Error.WriteLine("Make sure your browser is running with remote debugging enabled:");
-            Console.Error.WriteLine("  Edge:   msedge --remote-debugging-port=9222");
-            Console.Error.WriteLine("  Chrome: chrome --remote-debugging-port=9222");
+            await using var bidi = await BiDiSession.TryOpenAsync(port);
+            if (bidi != null)
+            {
+                tabs = await GetFirefoxTabs(bidi);
+                protocol = "WebDriver BiDi";
+            }
+        }
+
+        if (tabs.Count == 0)
+        {
+            PrintNoTabsHelp(port);
             return 1;
         }
 
-        Console.WriteLine($"Browser tabs (CDP port {port}):");
+        Console.WriteLine($"Browser tabs ({protocol} port {port}):");
         Console.WriteLine(new string('-', 80));
 
         foreach (var tab in tabs)
         {
-            Console.WriteLine($"[{tab.Id[..8]}] {tab.Title}");
+            Console.WriteLine($"[{tab.Id[..Math.Min(8, tab.Id.Length)]}] {tab.Title}");
             Console.WriteLine($"           {tab.Url}");
         }
 
         return 0;
     }
 
-    private static async Task<int> CaptureBrowserTab(string searchTerm, bool exactMatch, int port, bool fullPage)
+    private static BrowserTab? FindMatchingTab(List<BrowserTab> tabs, string searchTerm, bool exactMatch)
     {
-        var tabs = await GetBrowserTabs(port);
-
-        if (tabs.Count == 0)
-        {
-            Console.Error.WriteLine($"Error: No browser tabs found on port {port}");
-            Console.Error.WriteLine("Start browser with: msedge --remote-debugging-port=9222");
-            return 1;
-        }
-
         string searchLower = searchTerm.ToLowerInvariant();
-        var matchingTab = tabs.FirstOrDefault(t =>
+        return tabs.FirstOrDefault(t =>
         {
             if (exactMatch)
             {
@@ -407,27 +416,15 @@ class Program
                        t.Url.ToLowerInvariant().Contains(searchLower);
             }
         });
+    }
 
-        if (matchingTab == null)
-        {
-            Console.Error.WriteLine($"Error: No tab found matching \"{searchTerm}\"");
-            Console.Error.WriteLine("Use --tabs to see available tabs");
-            return 1;
-        }
-
-        if (string.IsNullOrEmpty(matchingTab.WebSocketDebuggerUrl))
-        {
-            Console.Error.WriteLine("Error: Tab does not have WebSocket debugger URL");
-            return 1;
-        }
-
-        string? screenshotPath = await CaptureTabViaCDP(matchingTab, fullPage);
-
+    private static int ReportTabCapture(string? screenshotPath, BrowserTab tab)
+    {
         if (screenshotPath != null)
         {
             Console.WriteLine($"Screenshot saved: {screenshotPath}");
-            Console.WriteLine($"Tab: {matchingTab.Title}");
-            Console.WriteLine($"URL: {matchingTab.Url}");
+            Console.WriteLine($"Tab: {tab.Title}");
+            Console.WriteLine($"URL: {tab.Url}");
             return 0;
         }
         else
@@ -437,9 +434,52 @@ class Program
         }
     }
 
-    // Sends a CDP command and waits for the response matching the given id,
-    // discarding any event messages that arrive before it.
-    private static async Task<JsonDocument> SendCdpCommandAsync(ClientWebSocket ws, int id, string method, object? cmdParams = null)
+    private static int ReportNoMatchingTab(string searchTerm)
+    {
+        Console.Error.WriteLine($"Error: No tab found matching \"{searchTerm}\"");
+        Console.Error.WriteLine("Use --tabs to see available tabs");
+        return 1;
+    }
+
+    private static async Task<int> CaptureBrowserTab(string searchTerm, bool exactMatch, int port, bool fullPage)
+    {
+        var tabs = await GetBrowserTabs(port);
+
+        if (tabs.Count == 0)
+        {
+            return await CaptureFirefoxTab(searchTerm, exactMatch, port, fullPage);
+        }
+
+        var matchingTab = FindMatchingTab(tabs, searchTerm, exactMatch);
+
+        if (matchingTab == null)
+        {
+            return ReportNoMatchingTab(searchTerm);
+        }
+
+        if (string.IsNullOrEmpty(matchingTab.WebSocketDebuggerUrl))
+        {
+            Console.Error.WriteLine("Error: Tab does not have WebSocket debugger URL");
+            return 1;
+        }
+
+        return ReportTabCapture(await CaptureTabViaCDP(matchingTab, fullPage), matchingTab);
+    }
+
+    private static async Task<string> SaveBase64Png(string base64Data)
+    {
+        byte[] imageData = Convert.FromBase64String(base64Data);
+
+        string fileName = $"screenshot_{DateTime.Now:yyyyMMdd_HHmmss}.png";
+        string filePath = Path.Combine(Path.GetTempPath(), fileName);
+
+        await File.WriteAllBytesAsync(filePath, imageData);
+        return filePath;
+    }
+
+    // Sends a CDP or WebDriver BiDi command and waits for the response matching
+    // the given id, discarding any event messages that arrive before it.
+    private static async Task<JsonDocument> SendWsCommandAsync(ClientWebSocket ws, int id, string method, object? cmdParams = null)
     {
         var command = new Dictionary<string, object?> { ["id"] = id, ["method"] = method };
         if (cmdParams != null)
@@ -480,7 +520,7 @@ class Program
             if (fullPage)
             {
                 // Step 1: get full page dimensions
-                using var metricsDoc = await SendCdpCommandAsync(ws, 1, "Page.getLayoutMetrics");
+                using var metricsDoc = await SendWsCommandAsync(ws, 1, "Page.getLayoutMetrics");
                 var resultProp = metricsDoc.RootElement.GetProperty("result");
 
                 // Prefer cssContentSize (Chrome 77+), fall back to contentSize
@@ -492,7 +532,7 @@ class Program
                 int pageHeight = (int)Math.Ceiling(contentSize.GetProperty("height").GetDouble());
 
                 // Step 2: expand viewport to full page height
-                using var overrideDoc = await SendCdpCommandAsync(ws, 2, "Emulation.setDeviceMetricsOverride", new
+                using var overrideDoc = await SendWsCommandAsync(ws, 2, "Emulation.setDeviceMetricsOverride", new
                 {
                     width = pageWidth,
                     height = pageHeight,
@@ -501,14 +541,14 @@ class Program
                 });
 
                 // Step 3: capture full page
-                using var screenshotDoc = await SendCdpCommandAsync(ws, 3, "Page.captureScreenshot", new
+                using var screenshotDoc = await SendWsCommandAsync(ws, 3, "Page.captureScreenshot", new
                 {
                     format = "png",
                     captureBeyondViewport = true
                 });
 
                 // Step 4: restore original viewport
-                using var clearDoc = await SendCdpCommandAsync(ws, 4, "Emulation.clearDeviceMetricsOverride");
+                using var clearDoc = await SendWsCommandAsync(ws, 4, "Emulation.clearDeviceMetricsOverride");
 
                 if (!screenshotDoc.RootElement.TryGetProperty("result", out var screenshotResult) ||
                     !screenshotResult.TryGetProperty("data", out var dataEl))
@@ -522,7 +562,7 @@ class Program
             }
             else
             {
-                using var screenshotDoc = await SendCdpCommandAsync(ws, 1, "Page.captureScreenshot", new
+                using var screenshotDoc = await SendWsCommandAsync(ws, 1, "Page.captureScreenshot", new
                 {
                     format = "png",
                     captureBeyondViewport = false
@@ -539,13 +579,7 @@ class Program
                 base64Data = dataEl.GetString()!;
             }
 
-            byte[] imageData = Convert.FromBase64String(base64Data);
-
-            string fileName = $"screenshot_{DateTime.Now:yyyyMMdd_HHmmss}.png";
-            string filePath = Path.Combine(Path.GetTempPath(), fileName);
-
-            await File.WriteAllBytesAsync(filePath, imageData);
-            return filePath;
+            return await SaveBase64Png(base64Data);
         }
         catch (Exception ex)
         {
@@ -559,6 +593,143 @@ class Program
                 await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
             }
         }
+    }
+
+    #endregion
+
+    #region Firefox Tab Capture (WebDriver BiDi)
+
+    private sealed class BiDiException(string message) : Exception(message);
+
+    // Minimal WebDriver BiDi client. Firefox no longer supports CDP; its
+    // --remote-debugging-port serves BiDi at ws://127.0.0.1:<port>/session
+    // and allows only one session at a time.
+    private sealed class BiDiSession : IAsyncDisposable
+    {
+        private readonly ClientWebSocket ws = new();
+        private int nextId;
+        private bool sessionStarted;
+
+        public static async Task<BiDiSession?> TryOpenAsync(int port)
+        {
+            var session = new BiDiSession();
+            try
+            {
+                await session.ws.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/session"), CancellationToken.None);
+                await session.SendAsync("session.new", new { capabilities = new { } });
+                session.sessionStarted = true;
+                return session;
+            }
+            catch (Exception ex) when (ex is WebSocketException or BiDiException)
+            {
+                if (ex is BiDiException)
+                    Console.Error.WriteLine($"WebDriver BiDi error: {ex.Message}");
+                await session.DisposeAsync();
+                return null;
+            }
+        }
+
+        public async Task<JsonElement> SendAsync(string method, object cmdParams)
+        {
+            using var doc = await SendWsCommandAsync(ws, ++nextId, method, cmdParams);
+            var root = doc.RootElement;
+            if (root.GetProperty("type").GetString() == "error")
+                throw new BiDiException($"{root.GetProperty("error").GetString()}: {root.GetProperty("message").GetString()}");
+            return root.GetProperty("result").Clone();
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                if (sessionStarted && ws.State == WebSocketState.Open)
+                    await SendAsync("session.end", new { });
+                if (ws.State == WebSocketState.Open)
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
+            }
+            catch (Exception ex) when (ex is WebSocketException or BiDiException)
+            {
+                // Firefox may drop the socket as soon as the session ends
+            }
+            ws.Dispose();
+        }
+    }
+
+    private static async Task<List<BrowserTab>> GetFirefoxTabs(BiDiSession bidi)
+    {
+        var tree = await bidi.SendAsync("browsingContext.getTree", new { maxDepth = 0 });
+        var tabs = new List<BrowserTab>();
+
+        foreach (var context in tree.GetProperty("contexts").EnumerateArray())
+        {
+            string id = context.GetProperty("context").GetString()!;
+            tabs.Add(new BrowserTab
+            {
+                Id = id,
+                Url = context.GetProperty("url").GetString() ?? "",
+                Type = "page",
+                Title = await GetFirefoxTabTitle(bidi, id)
+            });
+        }
+
+        return tabs;
+    }
+
+    // BiDi's context tree has no titles, so read document.title from each tab
+    private static async Task<string> GetFirefoxTabTitle(BiDiSession bidi, string contextId)
+    {
+        try
+        {
+            var evaluation = await bidi.SendAsync("script.evaluate", new
+            {
+                expression = "document.title",
+                target = new { context = contextId },
+                awaitPromise = false
+            });
+
+            if (evaluation.GetProperty("type").GetString() == "success" &&
+                evaluation.GetProperty("result").TryGetProperty("value", out var value))
+                return value.GetString() ?? "";
+        }
+        catch (BiDiException)
+        {
+            // Some privileged pages refuse script evaluation; fall back to no title
+        }
+        return "";
+    }
+
+    private static async Task<int> CaptureFirefoxTab(string searchTerm, bool exactMatch, int port, bool fullPage)
+    {
+        await using var bidi = await BiDiSession.TryOpenAsync(port);
+        if (bidi == null)
+        {
+            PrintNoTabsHelp(port);
+            return 1;
+        }
+
+        var matchingTab = FindMatchingTab(await GetFirefoxTabs(bidi), searchTerm, exactMatch);
+        if (matchingTab == null)
+        {
+            return ReportNoMatchingTab(searchTerm);
+        }
+
+        string? screenshotPath = null;
+        try
+        {
+            // "document" origin captures the full scrollable page natively
+            var screenshot = await bidi.SendAsync("browsingContext.captureScreenshot", new
+            {
+                context = matchingTab.Id,
+                origin = fullPage ? "document" : "viewport"
+            });
+            screenshotPath = await SaveBase64Png(screenshot.GetProperty("data").GetString()!);
+        }
+        catch (BiDiException ex)
+        {
+            Console.Error.WriteLine($"WebDriver BiDi error: {ex.Message}");
+        }
+
+        return ReportTabCapture(screenshotPath, matchingTab);
     }
 
     #endregion
